@@ -11,15 +11,38 @@ import (
 
 // testLogger 把每次准入/排队/拒绝/释放决策与资源快照打印到测试日志，
 // 满足"单测日志中需要打印每次准入与释放的决策依据及资源快照"。
-type testLogger struct{ t *testing.T }
+type testLogger struct {
+	t     *testing.T
+	mu    sync.Mutex
+	ended bool
+}
 
-func (l testLogger) Logf(format string, args ...any) {
+// newTestLogger 构造一个在测试结束后自动静默的日志器。部分用例刻意保留
+// 无视 ctx 的永久阻塞任务，其 goroutine 在 *testing.T 失效后仍可能存活。
+// 关键：t.Logf 与 cleanup 的"标记结束"持有同一把 mu，彻底消除
+// "检查 ended 与真正调用 t.Logf 之间"的窗口，杜绝在已销毁 testing 上竞争。
+func newTestLogger(t *testing.T) *testLogger {
+	l := &testLogger{t: t}
+	t.Cleanup(func() {
+		l.mu.Lock()
+		l.ended = true
+		l.mu.Unlock()
+	})
+	return l
+}
+
+func (l *testLogger) Logf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ended {
+		return
+	}
 	l.t.Logf(format, args...)
 }
 
 func newTestScheduler(t *testing.T, cfg Config) *Scheduler {
 	t.Helper()
-	return New(cfg).WithLogger(testLogger{t})
+	return New(cfg).WithLogger(newTestLogger(t))
 }
 
 func waitHandle(t *testing.T, h *Handle, timeout time.Duration) {

@@ -25,6 +25,7 @@ func nowMillis() int64 { return time.Now().UnixMilli() }
 // SimJob 声明一个确定性模拟任务。
 type SimJob struct {
 	ID       string
+	Group    string // 所属业务组；空串为默认组
 	Cost     int64
 	Priority Priority
 	LengthMS int64 // 虚拟占用时长（毫秒）
@@ -55,6 +56,10 @@ type DeterministicRunner struct {
 	handles  map[string]*Handle
 	gates    map[string]*simGate
 	terminal map[string]Status
+	// jobGroup 记录每个任务声明的组；admitGroup 记录准入回调带来的组，
+	// 分组可复现性测试会逐位比较"组:任务"构成的准入序列。
+	jobGroup   map[string]string
+	admitGroup map[string]string
 
 	clock      int64
 	total      int
@@ -69,13 +74,15 @@ type DeterministicRunner struct {
 // NewDeterministicRunner 包装调度器并安装确定性追踪钩子。
 func NewDeterministicRunner(s *Scheduler) *DeterministicRunner {
 	r := &DeterministicRunner{
-		s:        s,
-		plans:    map[string]runningJob{},
-		length:   map[string]int64{},
-		handles:  map[string]*Handle{},
-		gates:    map[string]*simGate{},
-		terminal: map[string]Status{},
-		settleCh: make(chan struct{}, 1<<16),
+		s:          s,
+		plans:      map[string]runningJob{},
+		length:     map[string]int64{},
+		handles:    map[string]*Handle{},
+		gates:      map[string]*simGate{},
+		terminal:   map[string]Status{},
+		jobGroup:   map[string]string{},
+		admitGroup: map[string]string{},
+		settleCh:   make(chan struct{}, 1<<16),
 	}
 	s.onAdmit = r.onAdmit
 	s.onTerminal = r.onTerminal
@@ -100,8 +107,10 @@ func (r *DeterministicRunner) SubmitAll(jobs []SimJob) map[string]error {
 		g := newSimGate()
 		r.length[j.ID] = j.LengthMS
 		r.gates[j.ID] = g
+		r.jobGroup[j.ID] = j.Group
 		tk := &Task{
 			ID:       j.ID,
+			Group:    j.Group,
 			Cost:     j.Cost,
 			Priority: j.Priority,
 			Fn: func(ctx context.Context) error {
@@ -127,11 +136,12 @@ func (r *DeterministicRunner) SubmitAll(jobs []SimJob) map[string]error {
 	return errs
 }
 
-// onAdmit 在 mu 下被调度器回调：登记结束 tick 与准入顺序。
+// onAdmit 在 mu 下被调度器回调：登记结束 tick、准入顺序与所属组。
 // 计划只写一次且永不删除；任务是否仍在运行由 plans/terminal 动态推导。
-func (r *DeterministicRunner) onAdmit(id string) {
+func (r *DeterministicRunner) onAdmit(id string, group string) {
 	r.mu.Lock()
 	r.admitOrder = append(r.admitOrder, id)
+	r.admitGroup[id] = group
 	if _, exists := r.plans[id]; !exists {
 		// 排队任务被准入时才开始计时（排队不消耗资源、不推进其执行期）。
 		r.plans[id] = runningJob{endTick: r.clock + r.length[id]}
@@ -176,21 +186,22 @@ func (r *DeterministicRunner) pumpDispatch() {
 	type launched struct {
 		h *Handle
 		t *Task
+		c *charge
 	}
 	var todo []launched
 
 	r.s.mu.Lock()
 	for {
-		h, t, _ := r.s.dispatchOneLocked()
+		h, t, c := r.s.dispatchOneLocked()
 		if h == nil {
 			break
 		}
-		todo = append(todo, launched{h, t})
+		todo = append(todo, launched{h, t, c})
 	}
 	r.s.mu.Unlock()
 
 	for _, l := range todo {
-		r.s.launch(l.h, l.t)
+		r.s.launch(l.h, l.t, l.c)
 	}
 }
 
@@ -312,12 +323,24 @@ func (r *DeterministicRunner) waitTerminal(id string, max time.Duration) {
 	}
 }
 
-// AdmitOrder 返回确定性的准入顺序快照。
+// AdmitOrder 返回确定性的准入任务 ID 序列快照。
 func (r *DeterministicRunner) AdmitOrder() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]string, len(r.admitOrder))
 	copy(out, r.admitOrder)
+	return out
+}
+
+// AdmitGroupSequence 返回与 AdmitOrder 对齐的 "group/task" 序列，
+// 供分组层的可复现性比对。
+func (r *DeterministicRunner) AdmitGroupSequence() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.admitOrder))
+	for i, id := range r.admitOrder {
+		out[i] = r.admitGroup[id] + "/" + id
+	}
 	return out
 }
 

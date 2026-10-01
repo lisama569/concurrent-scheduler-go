@@ -35,7 +35,7 @@ func runDeterministic(t *testing.T, jobs []SimJob, cfg Config, log bool) ([]stri
 	t.Helper()
 	s := New(cfg)
 	if log {
-		s.WithLogger(testLogger{t})
+		s.WithLogger(newTestLogger(t))
 	}
 	r := NewDeterministicRunner(s)
 	r.freeze()

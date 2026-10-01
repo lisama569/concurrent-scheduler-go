@@ -223,7 +223,7 @@ func TestBlockedTaskDoesNotCorruptAccounts(t *testing.T) {
 // TestDoubleReleaseGuardsAccount：白盒验证重复释放会被账本立即拦截，
 // 而不是静默造成账目为负。
 func TestDoubleReleaseGuardsAccount(t *testing.T) {
-	q := newQuota(Config{MaxConcurrency: 2, ResourceLimit: 10})
+	q := newQuota(2, 10)
 	q.admit(4)
 	q.release(4)
 	defer func() {
