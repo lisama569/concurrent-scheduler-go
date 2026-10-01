@@ -25,6 +25,7 @@ func nowMillis() int64 { return time.Now().UnixMilli() }
 // SimJob 声明一个确定性模拟任务。
 type SimJob struct {
 	ID       string
+	Group    string // 所属业务组；空串为内建默认组
 	Cost     int64
 	Priority Priority
 	LengthMS int64 // 虚拟占用时长（毫秒）
@@ -102,6 +103,7 @@ func (r *DeterministicRunner) SubmitAll(jobs []SimJob) map[string]error {
 		r.gates[j.ID] = g
 		tk := &Task{
 			ID:       j.ID,
+			Group:    j.Group,
 			Cost:     j.Cost,
 			Priority: j.Priority,
 			Fn: func(ctx context.Context) error {

@@ -9,6 +9,7 @@ import (
 // SimTaskSpec 是模拟负载中单个任务的声明参数。
 type SimTaskSpec struct {
 	ID       string
+	Group    string // 业务组名；空串为内建默认组
 	Cost     int64
 	Priority Priority
 	Duration time.Duration
@@ -117,9 +118,23 @@ func (sp SimTaskSpec) TaskOf() *Task {
 	}
 	return &Task{
 		ID:       sp.ID,
+		Group:    sp.Group,
 		Cost:     sp.Cost,
 		Priority: sp.Priority,
 		Timeout:  sp.Timeout,
 		Fn:       fn,
 	}
+}
+
+// AssignGroups 按"索引对 groupCount 取模"把规格确定性地分配到名为
+// g-0..g-(n-1) 的业务组。分组只取决于位置，不依赖随机源，因此与固定
+// 种子负载配合时，分组层的调度轨迹也逐字节可复现。
+func AssignGroups(specs []SimTaskSpec, groupCount int) []SimTaskSpec {
+	if groupCount <= 0 {
+		return specs
+	}
+	for i := range specs {
+		specs[i].Group = "g-" + itoa(i%groupCount)
+	}
+	return specs
 }

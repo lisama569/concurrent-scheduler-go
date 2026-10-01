@@ -22,6 +22,7 @@ func jobsFromSpecs(specs []SimTaskSpec) []SimJob {
 		}
 		jobs = append(jobs, SimJob{
 			ID:       sp.ID,
+			Group:    sp.Group,
 			Cost:     sp.Cost,
 			Priority: sp.Priority,
 			LengthMS: length,

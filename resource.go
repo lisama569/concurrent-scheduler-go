@@ -44,6 +44,19 @@ func (q *quota) release(cost int64) {
 	}
 }
 
+// reconfigure 运行期调整全局上限。与组级缩容语义一致：只改上限，
+// 不驱逐在运行任务；缩容后 used 可能瞬时高于新上限，此时仅冻结新准入，
+// 等在运行任务自然结算回落。新上限永远不会被在跑任务"顶穿"——
+// canAdmit 按新上限逐次把关。
+func (q *quota) reconfigure(maxConcurrency int, resourceLimit int64) {
+	if maxConcurrency > 0 {
+		q.maxConcurrency = maxConcurrency
+	}
+	if resourceLimit >= 0 {
+		q.resourceLimit = resourceLimit
+	}
+}
+
 // snapshot 在调用方持锁时拷贝出当前账目（附加字段由调度器补齐）。
 func (q *quota) snapshot() Snapshot {
 	return Snapshot{
@@ -63,4 +76,6 @@ type Snapshot struct {
 	Queued         int
 	Paused         bool
 	Stopped        bool
+	// Groups 为各业务组的账目快照，按组名为键。
+	Groups map[string]GroupSnapshot
 }

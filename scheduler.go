@@ -8,33 +8,38 @@ import (
 	"sync"
 )
 
-// Config 声明调度器的硬约束：
-//   - MaxConcurrency：同时运行任务数上限（并发度配额）；
-//   - ResourceLimit：所有运行中任务 Cost 之和的上限（总资源配额）；
-//   - QueueCapacity：等待队列容量，<=0 表示无界。
+// Config 声明调度器的全局硬约束：
+//   - MaxConcurrency：同时运行任务数上限（全局并发度配额）；
+//   - ResourceLimit：所有运行中任务 Cost 之和的上限（全局总资源配额）；
+//   - QueueCapacity：全局等待队列容量，<=0 表示无界。
+//
+// 组级上限是这些全局上限之外的"额外硬约束"：任务必须同时满足全局账
+// 与所属组账才能准入，任何一个组都不能动用别的组的预算。
 type Config struct {
 	MaxConcurrency int
 	ResourceLimit  int64
 	QueueCapacity  int
 }
 
-// Scheduler 是进程内的并发任务调度器。
+// Scheduler 是进程内的并发任务调度器（多业务组版本）。
 //
-// 同步模型：所有账目变更与队列操作都在唯一的 mu 临界区内完成；
-// 任务在独立 goroutine 中执行，但"准入记账"与"结算释放"均回到 mu 下进行，
-// 从而保证：检查与记账之间不存在 TOCTOU 窗口、每个任务的资源恰好释放一次。
+// 同步模型：所有账目变更、组注册表操作与队列操作都在唯一的 mu 临界区内
+// 完成；任务在独立 goroutine 中执行，但"准入记账"与"结算释放"均回到 mu
+// 下进行，从而保证：检查与记账之间不存在 TOCTOU 窗口、每个任务的资源
+// （全局账与组账两本）恰好释放一次。
 type Scheduler struct {
-	cfg Config
-	log Logger
+	cfg      Config
+	queueCap int
+	log      Logger
 
-	mu      sync.Mutex
-	cond    *sync.Cond // 与 mu 联动，唤醒唯一的 dispatch 循环
-	quota   *quota
-	queue   *waitQueue
-	seq     uint64
-	paused  bool
-	stopped bool
-	wg      sync.WaitGroup // 追踪所有已准入任务，供优雅关闭等待
+	mu       sync.Mutex
+	cond     *sync.Cond // 与 mu 联动，唤醒唯一的 dispatch 循环
+	quota    *quota
+	registry *groupRegistry
+	seq      uint64
+	paused   bool
+	stopped  bool
+	wg       sync.WaitGroup // 追踪全部已准入任务，供全局优雅关闭等待
 
 	// onAdmit / onTerminal 为可选测试钩子，用于可复现性测试采集准入与
 	// 终态序列；生产路径保持为 nil。
@@ -49,8 +54,10 @@ type Scheduler struct {
 	settleBarrier func(id string)
 }
 
-// New 创建调度器并启动派发循环。
-func New(cfg Config) *Scheduler {
+// New 创建调度器并启动派发循环。可选的 groups 用于预先注册业务组；
+// 不传任何组时，行为与单池版本完全一致（任务都落在内建默认组，
+// 默认组没有任何组级配额，仅受全局上限约束）。
+func New(cfg Config, groups ...GroupConfig) *Scheduler {
 	if cfg.MaxConcurrency <= 0 {
 		panic("scheduler: Config.MaxConcurrency must be > 0")
 	}
@@ -58,14 +65,60 @@ func New(cfg Config) *Scheduler {
 		panic("scheduler: Config.ResourceLimit must be >= 0")
 	}
 	s := &Scheduler{
-		cfg:   cfg,
-		log:   nopLogger{},
-		quota: newQuota(cfg),
-		queue: newWaitQueue(cfg.QueueCapacity),
+		cfg:      cfg,
+		queueCap: cfg.QueueCapacity,
+		log:      nopLogger{},
+		quota:    newQuota(cfg),
+		registry: newGroupRegistry(),
+	}
+	s.registry.ensureDefault()
+	for _, g := range groups {
+		if err := s.registry.configure(g); err != nil {
+			panic(err)
+		}
 	}
 	s.cond = sync.NewCond(&s.mu)
 	go s.dispatchLoop()
 	return s
+}
+
+// ConfigureGroup 运行期注册新业务组或调整已有业务组的组级上限：
+//   - 新组随时可加入，加入后该组提交立即按其预算受约束；
+//   - 加容量：只改上限并唤醒派发，等待中的任务可继续往前走；
+//   - 缩容量：不驱逐在运行任务，used 可能瞬时高于新上限，期间冻结该组
+//     新准入，等在跑任务结算自然回落，账目任何时候都对得上。
+func (s *Scheduler) ConfigureGroup(cfg GroupConfig) error {
+	if cfg.Name == DefaultGroup {
+		return fmt.Errorf("scheduler: default group is built-in and cannot be reconfigured")
+	}
+	s.mu.Lock()
+	err := s.registry.configure(cfg)
+	s.mu.Unlock()
+	if err == nil {
+		s.cond.Broadcast()
+	}
+	return err
+}
+
+// UpdateLimits 运行期调整全局上限（并发/资源/队列容量）。
+// 缩容语义与组级一致：不杀在运行任务，仅按新上限冻结后续准入。
+// 非法参数与 New 一样按编程错误 panic。
+func (s *Scheduler) UpdateLimits(cfg Config) {
+	if cfg.MaxConcurrency <= 0 {
+		panic("scheduler: Config.MaxConcurrency must be > 0")
+	}
+	if cfg.ResourceLimit < 0 {
+		panic("scheduler: Config.ResourceLimit must be >= 0")
+	}
+	s.mu.Lock()
+	s.cfg = cfg
+	s.queueCap = cfg.QueueCapacity
+	s.quota.reconfigure(cfg.MaxConcurrency, cfg.ResourceLimit)
+	snap := s.snapshotLocked()
+	s.mu.Unlock()
+	logDecision(s.log, "UPDATE-LIMITS", DefaultGroup, "-", 0,
+		"global limits adjusted; running tasks are not evicted", snap)
+	s.cond.Broadcast()
 }
 
 // WithLogger 注入决策日志器（须在提交任务前调用）。
@@ -76,13 +129,16 @@ func (s *Scheduler) WithLogger(l Logger) *Scheduler {
 	return s
 }
 
-// Submit 申请准入一个任务：
-//   - 已关闭        => ReasonSchedulerStopped（显式拒绝，不丢弃）
-//   - Cost > 硬上限 => ReasonExceedsHardLimit（即使空闲也永远满足不了，立即拒绝）
-//   - 队列已满      => ReasonQueueFull
-//   - 其余情况排队等待；若当前可立即满足则直接准入。
-//
-// 返回的 Handle 可用于等待 / 取消；排队中被取消的任务不执行任何用户代码。
+// Submit 申请准入一个任务，任务通过 Task.Group 声明所属业务组。
+// 拒绝原因彼此可区分，任务绝不被静默丢弃：
+//   - 调度器已关闭         => ReasonSchedulerStopped
+//   - 组未注册             => ReasonUnknownGroup
+//   - 该组已被 CloseGroup  => ReasonGroupStopped
+//   - Cost > 全局硬上限    => ReasonExceedsHardLimit
+//   - Cost > 本组硬上限    => ReasonGroupExceedsHardLimit
+//   - 全局排队区已满       => ReasonQueueFull
+//   - 其余情况排队等待（Handle.BlockReason 记录被哪个维度挡住）；
+//     若当前组账与全局账都可立即满足，则直接准入。
 func (s *Scheduler) Submit(parent context.Context, t *Task) (*Handle, error) {
 	if t == nil || t.Fn == nil {
 		return nil, fmt.Errorf("scheduler: task and task.Fn must not be nil")
@@ -90,62 +146,115 @@ func (s *Scheduler) Submit(parent context.Context, t *Task) (*Handle, error) {
 	if t.Cost < 0 {
 		return nil, fmt.Errorf("scheduler: task %q has negative cost", t.ID)
 	}
+	groupName := t.Group
+	if groupName == DefaultGroup {
+		groupName = DefaultGroup // 显式归一，便于日志与账目
+	}
 
 	ctx, cancel := context.WithCancel(parent)
 	h := newHandle(t, ctx)
 	h.bindCancel(cancel)
 
 	s.mu.Lock()
+	g := s.registry.get(groupName)
+	h.group = groupName
 	switch {
 	case s.stopped:
-		h.finish(StatusRejected, reasonError(t.ID, ReasonSchedulerStopped, "scheduler is shutting down"))
+		h.finish(StatusRejected, reasonError(t.ID, groupName, ReasonSchedulerStopped, "scheduler is shutting down"))
 		snap := s.snapshotLocked()
 		s.mu.Unlock()
-		logDecision(s.log, "REJECT", t.ID, t.Cost, "scheduler stopped", snap)
+		logDecision(s.log, "REJECT", groupName, t.ID, t.Cost, "scheduler stopped", snap)
+		return h, h.Err()
+	case g == nil:
+		h.finish(StatusRejected, reasonError(t.ID, groupName, ReasonUnknownGroup,
+			fmt.Sprintf("group %q is not registered; call ConfigureGroup first", groupName)))
+		snap := s.snapshotLocked()
+		s.mu.Unlock()
+		logDecision(s.log, "REJECT", groupName, t.ID, t.Cost, "unknown group", snap)
+		return h, h.Err()
+	case g.stopped:
+		h.finish(StatusRejected, reasonError(t.ID, groupName, ReasonGroupStopped,
+			fmt.Sprintf("group %q is closed (CloseGroup); other groups unaffected", groupName)))
+		snap := s.snapshotLocked()
+		s.mu.Unlock()
+		logDecision(s.log, "REJECT", groupName, t.ID, t.Cost, "group stopped", snap)
 		return h, h.Err()
 	case t.Cost > s.cfg.ResourceLimit:
-		h.finish(StatusRejected, reasonError(t.ID, ReasonExceedsHardLimit,
-			fmt.Sprintf("cost %d > resource limit %d", t.Cost, s.cfg.ResourceLimit)))
+		h.finish(StatusRejected, reasonError(t.ID, groupName, ReasonExceedsHardLimit,
+			fmt.Sprintf("cost %d > global resource limit %d", t.Cost, s.cfg.ResourceLimit)))
 		snap := s.snapshotLocked()
 		s.mu.Unlock()
-		logDecision(s.log, "REJECT", t.ID, t.Cost, "cost exceeds hard limit", snap)
+		logDecision(s.log, "REJECT", groupName, t.ID, t.Cost, "cost exceeds global hard limit", snap)
 		return h, h.Err()
-	case s.queue.full():
-		h.finish(StatusRejected, reasonError(t.ID, ReasonQueueFull,
-			fmt.Sprintf("waiting queue at capacity %d", s.cfg.QueueCapacity)))
+	case g.resourceLimit != unlimitedResource && t.Cost > g.resourceLimit:
+		h.finish(StatusRejected, reasonError(t.ID, groupName, ReasonGroupExceedsHardLimit,
+			fmt.Sprintf("cost %d > group %q resource limit %d", t.Cost, groupName, g.resourceLimit)))
 		snap := s.snapshotLocked()
 		s.mu.Unlock()
-		logDecision(s.log, "REJECT", t.ID, t.Cost, "queue full", snap)
+		logDecision(s.log, "REJECT", groupName, t.ID, t.Cost, "cost exceeds group hard limit", snap)
+		return h, h.Err()
+	case s.queueCap > 0 && s.registry.totalQueued() >= s.queueCap:
+		h.finish(StatusRejected, reasonError(t.ID, groupName, ReasonQueueFull,
+			fmt.Sprintf("global waiting queue at capacity %d", s.queueCap)))
+		snap := s.snapshotLocked()
+		s.mu.Unlock()
+		logDecision(s.log, "REJECT", groupName, t.ID, t.Cost, "global queue full", snap)
 		return h, h.Err()
 	}
 
-	if !s.paused && !s.dispatchFrozen && s.quota.canAdmit(t.Cost) {
-		// 立即准入路径：与排队准入共用 quota 的同一段记账逻辑，口径一致。
-		// wg.Add 必须在 mu 内、Shutdown 的 Wait 之前完成，避免 WaitGroup 误用。
+	if !s.paused && !s.dispatchFrozen && g.canAdmit(t.Cost) && s.quota.canAdmit(t.Cost) {
+		// 立即准入路径：组账与全局账在同一临界区内一起记账，口径与
+		// 排队准入完全一致。wg.Add 在 mu 内完成，先于任何 Wait。
 		s.seq++
 		s.quota.admit(t.Cost)
+		g.admit(h, t.Cost)
 		s.wg.Add(1)
 		s.fireAdmitLocked(t.ID)
 		snap := s.snapshotLocked()
 		s.mu.Unlock()
-		logDecision(s.log, "ADMIT", t.ID, t.Cost, "submit: concurrency & resource both available", snap)
+		logDecision(s.log, "ADMIT", groupName, t.ID, t.Cost,
+			"submit: group & global concurrency/resource all available", snap)
 		s.launch(h, t)
 		return h, nil
 	}
 
+	// 排队：记录它究竟被哪个维度挡住，方便复盘；任务只会排队，不会丢。
 	s.seq++
 	seq := s.seq
-	s.queue.push(h, t.Cost, t.Priority, seq)
+	h.setBlockReason(s.classifyBlockLocked(g, t.Cost))
+	g.queue.push(h, groupName, t.Cost, t.Priority, seq)
 	snap := s.snapshotLocked()
 	paused := s.paused
+	block := h.BlockReason()
 	s.mu.Unlock()
-	logDecision(s.log, "ENQUEUE", t.ID, t.Cost,
-		fmt.Sprintf("paused=%t or quota unavailable; priority=%d seq=%d", paused, t.Priority, seq), snap)
+	logDecision(s.log, "ENQUEUE", groupName, t.ID, t.Cost,
+		fmt.Sprintf("paused=%t block=%s priority=%d seq=%d", paused, block, t.Priority, seq), snap)
 	s.cond.Signal()
 
-	// 排队期间 ctx 被取消（调用方取消 / Cancel / Shutdown）：从队列摘除并结算。
-	go s.waitQueuedCancel(h)
+	// 排队期间 ctx 被取消（调用方取消 / Cancel / Shutdown / CloseGroup）：
+	// 用 context.AfterFunc 注册一次性回调，任务结算时显式注销——
+	// 长期运行下监听协程数量随"在排队任务数"而非"累计提交任务数"变化。
+	stop := context.AfterFunc(h.ctx, func() { s.waitQueuedCancel(h) })
+	h.bindWatch(stop)
 	return h, nil
+}
+
+// classifyBlockLocked 依据当前组账与全局账给出排队阻塞维度（mu 内调用）。
+// 组账优先判：本组预算不够时，即便全局也紧张，也明确记为"本组"原因。
+func (s *Scheduler) classifyBlockLocked(g *groupState, cost int64) BlockReason {
+	if g.maxConcurrency > 0 && g.inFlight >= g.maxConcurrency {
+		return BlockGroupConcurrency
+	}
+	if g.resourceLimit != unlimitedResource && g.resourceUsed+cost > g.resourceLimit {
+		return BlockGroupResource
+	}
+	if s.quota.inFlight >= s.quota.maxConcurrency {
+		return BlockGlobalConcurrency
+	}
+	if s.quota.resourceUsed+cost > s.quota.resourceLimit {
+		return BlockGlobalResource
+	}
+	return BlockNone // 暂停 / 冻结等非容量原因
 }
 
 // Pause 暂停派发：已在运行的任务不受影响，新提交与已排队任务一律等待。
@@ -154,7 +263,7 @@ func (s *Scheduler) Pause() {
 	s.paused = true
 	snap := s.snapshotLocked()
 	s.mu.Unlock()
-	logDecision(s.log, "PAUSE", "-", 0, "manual pause", snap)
+	logDecision(s.log, "PAUSE", DefaultGroup, "-", 0, "manual pause", snap)
 }
 
 // Resume 恢复派发并唤醒派发循环。
@@ -163,13 +272,76 @@ func (s *Scheduler) Resume() {
 	s.paused = false
 	snap := s.snapshotLocked()
 	s.mu.Unlock()
-	logDecision(s.log, "RESUME", "-", 0, "manual resume", snap)
+	logDecision(s.log, "RESUME", DefaultGroup, "-", 0, "manual resume", snap)
 	s.cond.Broadcast()
 }
 
-// Shutdown 优雅关闭：拒绝新任务、取消所有排队中任务、等待在运行任务
-// 直到它们结束或 ctx 到期。无论运行任务是否配合取消，账目都只会在其
-// goroutine 退出时被精确释放一次。
+// CloseGroup 只关闭单个业务组，其他组不受影响：
+//   - 该组立即停收新提交（ReasonGroupStopped）；
+//   - 清空该组排队任务并结算为 CANCELED（它们从未占用资源）；
+//   - 取消该组全部在运行任务的 ctx，请求它们退出；
+//   - 等待在运行任务结束，或 ctx 到期（ctx 的 Deadline 即"最大等待时间"）；
+//   - 超过最大等待仍不理会取消的任务：其容量被强制收回并标记 ABANDONED，
+//     调度器（含本组之外的所有组）可继续服务，账目不重复释放、不为负。
+func (s *Scheduler) CloseGroup(name string, ctx context.Context) error {
+	s.mu.Lock()
+	g := s.registry.get(name)
+	if g == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("scheduler: unknown group %q", name)
+	}
+	running := s.stopGroupLocked(g, "close-group")
+	s.mu.Unlock()
+	s.cond.Broadcast()
+
+	for _, h := range running {
+		h.Cancel()
+	}
+	return s.waitGroupSettle(g, running, ctx)
+}
+
+// stopGroupLocked 把一个组标记停收、摘空其队列并返回在运行句柄列表。
+func (s *Scheduler) stopGroupLocked(g *groupState, basis string) []*Handle {
+	g.stopped = true
+	for _, e := range g.queue.drain() {
+		e.handle.cancel()
+		e.handle.finish(StatusCanceled, ErrTaskCanceled)
+		logDecision(s.log, "CANCEL-GROUP", g.name, e.handle.task.ID, e.cost,
+			basis+": queued task canceled; never consumed quota", s.snapshotLocked())
+	}
+	running := make([]*Handle, 0, len(g.running))
+	for h := range g.running {
+		running = append(running, h)
+	}
+	return running
+}
+
+// waitGroupSettle 等待组内在运行任务全部结算；ctx 到期则回收剩余容量。
+func (s *Scheduler) waitGroupSettle(g *groupState, running []*Handle, ctx context.Context) error {
+	done := make(chan struct{})
+	go func() { g.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		s.log.Logf("DECISION action=GROUP-CLOSE-DONE group=%s task=- cost=0 basis=\"all running tasks settled\" | %s",
+			g.name, s.Snapshot())
+		return nil
+	case <-ctx.Done():
+		// 超过最大等待：把仍未退出（未脱管）任务的容量收回。
+		s.mu.Lock()
+		for _, h := range running {
+			if !h.detached {
+				s.abandonLocked(h, g, "group close max wait exceeded; capacity reclaimed")
+			}
+		}
+		s.mu.Unlock()
+		s.cond.Broadcast()
+		return ctx.Err()
+	}
+}
+
+// Shutdown 全局优雅关闭：所有组停收、取消全部排队与在运行任务，等待它们
+// 结束或 ctx 到期。ctx 的 Deadline 即最大等待时间：超时后仍卡住的任务
+// 被强制收回容量并标记 ABANDONED，账目归零，组件可被复用/重启。
 func (s *Scheduler) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	if s.stopped {
@@ -177,16 +349,17 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	s.stopped = true
-	// 摘空队列：排队任务从未记账，只需结算为取消。
-	for _, e := range s.queue.entries {
-		e.handle.cancel()
-		e.handle.finish(StatusCanceled, ErrTaskCanceled)
-		logDecision(s.log, "CANCEL-SHUTDOWN", e.handle.task.ID, e.cost,
-			"queued task canceled by shutdown; never consumed quota", s.snapshotLocked())
+	var running []*Handle
+	for _, name := range s.registry.names() {
+		g := s.registry.get(name)
+		running = append(running, s.stopGroupLocked(g, "shutdown")...)
 	}
-	s.queue.entries = nil
 	s.mu.Unlock()
 	s.cond.Broadcast() // 唤醒派发循环使其观察到 stopped 并退出
+
+	for _, h := range running {
+		h.Cancel()
+	}
 
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
@@ -195,11 +368,21 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 		s.log.Logf("DECISION action=SHUTDOWN-DONE task=- cost=0 basis=\"all running tasks settled\" | %s", s.Snapshot())
 		return nil
 	case <-ctx.Done():
+		// 超过最大等待仍有任务卡死：逐个收回它们仍占着的容量。
+		s.mu.Lock()
+		for _, h := range running {
+			if !h.detached {
+				s.abandonLocked(h, s.registry.get(h.group),
+					"shutdown max wait exceeded; capacity reclaimed")
+			}
+		}
+		s.mu.Unlock()
+		s.cond.Broadcast()
 		return ctx.Err()
 	}
 }
 
-// Snapshot 返回当前账目的一致快照。
+// Snapshot 返回当前账目（全局 + 各组）的一致快照。
 func (s *Scheduler) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -208,25 +391,30 @@ func (s *Scheduler) Snapshot() Snapshot {
 
 func (s *Scheduler) snapshotLocked() Snapshot {
 	snap := s.quota.snapshot()
-	snap.Queued = s.queue.len()
+	snap.Queued = s.registry.totalQueued()
 	snap.Paused = s.paused
 	snap.Stopped = s.stopped
+	groups := make(map[string]GroupSnapshot, len(s.registry.order))
+	for _, name := range s.registry.names() {
+		groups[name] = s.registry.get(name).snapshot()
+	}
+	snap.Groups = groups
 	return snap
 }
 
 // waitQueuedCancel 监听排队任务的取消信号；若任务先被派发取走（出队），
 // 摘除失败即为正常情况，结算完全交给运行路径，保证结算只发生一次。
 func (s *Scheduler) waitQueuedCancel(h *Handle) {
-	<-h.ctx.Done()
 	s.mu.Lock()
-	if !s.queue.remove(h) {
+	g := s.registry.get(h.group)
+	if g == nil || !g.queue.remove(h) {
 		s.mu.Unlock()
 		return
 	}
 	if h.finish(StatusCanceled, ErrTaskCanceled) {
 		snap := s.snapshotLocked()
 		s.mu.Unlock()
-		logDecision(s.log, "CANCEL-QUEUED", h.task.ID, h.task.Cost,
+		logDecision(s.log, "CANCEL-QUEUED", h.group, h.task.ID, h.task.Cost,
 			"context done while waiting; never consumed quota", snap)
 		s.cond.Signal()
 		return
@@ -242,55 +430,59 @@ func (s *Scheduler) dispatchOneLocked() (*Handle, *Task, int64) {
 	if s.stopped || s.paused {
 		return nil, nil, 0
 	}
-	e := s.queue.popEligible(s.quota)
+	e := s.registry.popEligible(s.quota.canAdmit)
 	if e == nil {
 		return nil, nil, 0
 	}
-	s.quota.admit(e.cost)
-	s.wg.Add(1)
-	s.fireAdmitLocked(e.handle.task.ID)
+	s.admitEntryLocked(e)
 	return e.handle, e.handle.task, e.cost
 }
 
-// dispatchLoop 是唯一的派发者：串行地从等待队列挑选可准入任务。
-// 单一派发者 + 全确定性的排序规则，是相同输入下调度顺序可复现的关键。
+// admitEntryLocked 在 mu 内对一个已出队条目做全局账 + 组账的统一记账。
+func (s *Scheduler) admitEntryLocked(e *waitEntry) {
+	s.quota.admit(e.cost)
+	s.registry.get(e.group).admit(e.handle, e.cost)
+	s.wg.Add(1)
+	s.fireAdmitLocked(e.handle.task.ID)
+}
+
+// dispatchLoop 是唯一的派发者：串行地从各组等待队列挑选可准入任务。
+// 组间严格轮转（registry 维护游标）+ 组内全确定排序，是相同输入下
+// 调度顺序可复现、且组间不会互相饿死的关键。
 func (s *Scheduler) dispatchLoop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
-		// 1) 锁内收集本批全部"当前可满足"的任务并记账。
-		//    全程不释放 mu，因此"谓词检查 -> cond.Wait"之间不存在缝隙，
-		//    settle 的 Signal 不可能落在该缝隙里，从根本上杜绝漏唤醒。
+		// 1) 锁内收集本批全部"当前可满足"的任务并记账。全程不释放 mu，
+		//    "谓词检查 -> cond.Wait"之间不存在缝隙，杜绝漏唤醒。
 		type admitted struct {
-			h    *Handle
-			t    *Task
-			cost int64
-			eff  int64
-			seq  uint64
-			snap Snapshot
+			h     *Handle
+			t     *Task
+			cost  int64
+			group string
+			eff   int64
+			seq   uint64
+			snap  Snapshot
 		}
 		var batch []admitted
 		for !s.stopped && !s.paused && !s.dispatchFrozen {
-			e := s.queue.popEligible(s.quota)
+			e := s.registry.popEligible(s.quota.canAdmit)
 			if e == nil {
 				break
 			}
-			s.quota.admit(e.cost)
-			s.wg.Add(1)
-			s.fireAdmitLocked(e.handle.task.ID)
+			s.admitEntryLocked(e)
 			batch = append(batch, admitted{
-				h: e.handle, t: e.handle.task, cost: e.cost,
+				h: e.handle, t: e.handle.task, cost: e.cost, group: e.group,
 				eff: e.effectivePriority(), seq: e.seq, snap: s.snapshotLocked(),
 			})
 		}
-		// 2) 锁外统一启动本批 goroutine（持锁启动没有必要，且会让
-		//    立即结束的任务在 launch 阶段排队争锁）。
+		// 2) 锁外统一启动本批 goroutine。
 		if len(batch) > 0 {
 			s.mu.Unlock()
 			for _, a := range batch {
-				logDecision(s.log, "ADMIT", a.t.ID, a.cost,
-					fmt.Sprintf("dispatch: effective-priority=%d seq=%d fits current quota",
-						a.eff, a.seq), a.snap)
+				logDecision(s.log, "ADMIT", a.group, a.t.ID, a.cost,
+					fmt.Sprintf("dispatch: group=%s effective-priority=%d seq=%d fits group & global quota",
+						a.group, a.eff, a.seq), a.snap)
 				s.launch(a.h, a.t)
 			}
 			s.mu.Lock()
@@ -298,18 +490,17 @@ func (s *Scheduler) dispatchLoop() {
 		if s.stopped {
 			return
 		}
-		// 3) 无法继续派发：对所有等待者做一次老化（每次真正进入等待计
-		//    一 tick），老任务的有效优先级终将超过后来的高优先级任务，
-		//    不会无限期饥饿。冻结态（确定性测试）不计时。
-		if !s.paused && !s.dispatchFrozen && s.queue.len() > 0 {
-			maxAge := s.queue.ageAll()
+		// 3) 无法继续派发：对所有组的等待者做一次老化（每次真正进入等待
+		//    计一 tick），组内老任务的有效优先级终将反超后来的高优任务，
+		//    但不会突破组间轮转边界。冻结态（确定性测试）不计时。
+		if !s.paused && !s.dispatchFrozen && s.registry.totalQueued() > 0 {
+			maxAge := s.registry.ageAll()
 			if maxAge > 0 && maxAge%16 == 0 {
 				s.log.Logf("STARVATION-WATCH max-wait-ticks=%d | %s", maxAge, s.snapshotLocked())
 			}
 		}
-		// 4) 冻结态直接等待在 cond 上（freezeDispatch 会广播唤醒它重判，
-		//    但它会因 dispatchFrozen 再次回到等待）；正常态在谓词循环中
-		//    等待，醒来后重新检查，杜绝漏唤醒。
+		// 4) 冻结态直接等待在 cond 上；正常态在谓词循环中等待，
+		//    醒来后重新检查，杜绝漏唤醒。
 		for s.dispatchFrozen || !s.canProgress() {
 			if s.stopped {
 				return
@@ -320,12 +511,12 @@ func (s *Scheduler) dispatchLoop() {
 }
 
 // canProgress 报告派发者此刻是否应被唤醒：
-// 已停止（需退出）、或非暂停/未冻结且存在可立即满足的任务。
+// 已停止（需退出）、或非暂停/未冻结且存在组账与全局账都可满足的任务。
 func (s *Scheduler) canProgress() bool {
 	if s.stopped {
 		return true
 	}
-	return !s.paused && !s.dispatchFrozen && s.queue.popProbe(s.quota)
+	return !s.paused && !s.dispatchFrozen && s.registry.popProbe(s.quota.canAdmit)
 }
 
 // freezeDispatch 仅供确定性测试：冻结异步派发与"立即准入"，并广播唤醒
@@ -352,10 +543,10 @@ func (s *Scheduler) fireAdmitLocked(id string) {
 	}
 }
 
-// run 是单个任务的全部执行与结算路径，与任务 goroutine 一一对应，
-// 因此 settle 只会被调用一次，资源精确释放一次。
+// run 是单个任务的全部执行与结算路径，与任务 goroutine 一一对应。
+// 注意：wg.Done / 组账与全局账的释放都在 settle（或 abandon）中完成，
+// 正常退出与"超时被放弃"两条路径恰好释放一次，因此这里不做 defer Done。
 func (s *Scheduler) run(h *Handle, t *Task) {
-	defer s.wg.Done()
 	h.markRunning()
 
 	runCtx := h.ctx
@@ -375,7 +566,8 @@ func (s *Scheduler) run(h *Handle, t *Task) {
 		defer func() {
 			if r := recover(); r != nil {
 				panicked = r
-				s.log.Logf("PANIC-ISOLATED task=%s recover=%v stack=%s", t.ID, r, debug.Stack())
+				s.log.Logf("PANIC-ISOLATED group=%s task=%s recover=%v stack=%s",
+					h.group, t.ID, r, debug.Stack())
 			}
 		}()
 		fnErr = t.Fn(runCtx)
@@ -401,15 +593,31 @@ func classify(t *Task, fnErr error, panicked any, ctx context.Context) (Status, 
 	}
 }
 
-// settle 完成"终态登记 + 账目释放"。仅由任务自身 goroutine 调用一次；
-// 排队取消 / 关闭路径从不调用本方法（那些任务未占资源）。
+// settle 完成"终态登记 + 两本账释放"，仅由任务自身 goroutine 调用一次。
+//
+// 零时间窗约定：终态（close Done）与容量归还处于同一个 mu 临界区、且
+// 容量归还先于终态可见。下游任务一旦看到上游的结果（Wait/Done 返回），
+// 空出来的全局与组容量必然已经在账上可见并已唤醒派发者，不会出现
+// "上游有结果了、下游却因容量没还回来而干等"的空窗。
 func (s *Scheduler) settle(h *Handle, t *Task, status Status, err error) {
-	h.finish(status, err)
 	s.mu.Lock()
-	s.quota.release(t.Cost) // 若重复释放，账本会立即 panic 暴露账目损坏
+	g := s.registry.get(h.group)
+	if h.detached {
+		// 已在关闭流程中被放弃：容量早已收回，这里只摘掉僵尸登记，
+		// 绝不再动账目，杜绝重复释放与负数。
+		if g != nil {
+			g.zombieDone(h)
+		}
+		h.finish(status, err) // 幂等：ABANDONED 终态已登记，此次不覆盖
+		s.mu.Unlock()
+		return
+	}
+	// 先归还容量（全局账 + 组账 + 等待计数），再登记终态，全程持锁。
+	s.quota.release(t.Cost)
+	g.release(h, t.Cost)
+	s.wg.Done()
+	h.finish(status, err)
 	snap := s.snapshotLocked()
-	// 终态记录与结算令牌都在 mu 内、且先于解锁完成：等待令牌的一方一旦
-	// 被唤醒，终态与账目必然都已可见，避免"收到令牌但终态表未更新"的竞态。
 	if s.onTerminal != nil {
 		s.onTerminal(t.ID, status)
 	}
@@ -417,7 +625,28 @@ func (s *Scheduler) settle(h *Handle, t *Task, status Status, err error) {
 		s.settleBarrier(t.ID)
 	}
 	s.mu.Unlock()
-	logDecision(s.log, "RELEASE", t.ID, t.Cost,
-		fmt.Sprintf("terminal=%s err=%v; quota returned exactly once", status, err), snap)
+	logDecision(s.log, "RELEASE", h.group, t.ID, t.Cost,
+		fmt.Sprintf("terminal=%s err=%v; group & global quota returned exactly once", status, err), snap)
 	s.cond.Signal()
+	h.endWatch()
+}
+
+// abandonLocked 在 mu 内放弃一个超过最大等待仍不退出的在运行任务：
+// 收回它在全局账与组账上的容量并登记 ABANDONED 终态。每个任务至多一次；
+// 其 goroutine 日后退出时走 settle 的 detached 分支，只摘登记、不碰账。
+func (s *Scheduler) abandonLocked(h *Handle, g *groupState, basis string) {
+	if h.detached {
+		return
+	}
+	h.detached = true
+	s.quota.release(h.task.Cost)
+	g.abandon(h, h.task.Cost)
+	s.wg.Done()
+	h.finish(StatusAbandoned, ErrTaskAbandoned)
+	if s.onTerminal != nil {
+		s.onTerminal(h.task.ID, StatusAbandoned)
+	}
+	logDecision(s.log, "RELEASE-ABANDON", g.name, h.task.ID, h.task.Cost,
+		basis+"; task detached, future exit will not touch accounts", s.snapshotLocked())
+	h.endWatch()
 }

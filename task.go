@@ -36,6 +36,10 @@ const (
 	StatusPanicked
 	// StatusRejected 在准入阶段被拒绝，未占用任何资源。
 	StatusRejected
+	// StatusAbandoned 在关闭（全局或本组）等待超过最大等待时间后，任务
+	// 仍不理会取消信号；调度器已把它占用的容量收回并将其标记为放弃。
+	// 此后该任务 goroutine 即便日后退出，也不会再触碰账目。
+	StatusAbandoned
 )
 
 func (s Status) String() string {
@@ -56,20 +60,30 @@ func (s Status) String() string {
 		return "PANICKED"
 	case StatusRejected:
 		return "REJECTED"
+	case StatusAbandoned:
+		return "ABANDONED"
 	default:
 		return "UNKNOWN"
 	}
 }
 
-// Task 由调用方声明资源开销、优先级、可选超时与执行体。
+// Task 由调用方声明所属业务组、资源开销、优先级、可选超时与执行体。
 type Task struct {
-	ID       string
+	ID string
+	// Group 为业务组名；空串（DefaultGroup）表示内建默认组（无组级配额），
+	// 从而与单池用法完全兼容。非空组必须先经 ConfigureGroup 注册，
+	// 否则提交会得到 ReasonUnknownGroup 的显式拒绝。
+	Group    string
 	Cost     int64
 	Priority Priority
 	// Timeout <= 0 表示不设任务级超时。
 	Timeout time.Duration
 	Fn      func(ctx context.Context) error
 }
+
+// ErrTaskAbandoned 表示任务在关闭流程中超过最大等待时间仍未退出，
+// 已被调度器放弃（容量已收回）。
+var ErrTaskAbandoned = errors.New("scheduler: task abandoned after shutdown max wait exceeded")
 
 // ErrTaskCanceled 表示任务被取消（排队中或运行中）。
 var ErrTaskCanceled = errors.New("scheduler: task canceled")
@@ -87,7 +101,59 @@ type Handle struct {
 	err    error
 	status Status
 	cancel context.CancelFunc
+	// block 为入队时判定的阻塞维度，排队期间可由调用方查询，
+	// 用于区分"本组预算不够 / 全局并发不够 / 全局资源不够"。
+	block BlockReason
+
+	// group 仅在 Scheduler.mu 下访问（解析后的所属组）。
+	group string
+	// watchStop 注销排队取消监听（context.AfterFunc 的停止函数），
+	// 与 cancel 一样在 Handle 自身的 mu 下访问。
+	watchStop context.CancelFunc
+	// detached 仅在 Scheduler.mu 下访问：任务已被放弃（容量已收回），
+	// 其僵尸 goroutine 日后退出时不得再次释放。
+	detached bool
 }
+
+// bindWatch 由调度器在注册排队取消监听成功后调用。
+func (h *Handle) bindWatch(stop func() bool) {
+	h.mu.Lock()
+	h.watchStop = func() { stop() }
+	h.mu.Unlock()
+}
+
+// endWatch 注销排队取消监听；并触发一次底层 context cancel，使
+// context.WithCancel 的相关资源随任务终态及时释放。cancel 幂等。
+func (h *Handle) endWatch() {
+	h.mu.Lock()
+	if h.watchStop != nil {
+		h.watchStop()
+		h.watchStop = nil
+	}
+	c := h.cancel
+	h.mu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
+// SetBlockReason 由调度器在入队时（mu 内）记录阻塞维度。
+func (h *Handle) setBlockReason(b BlockReason) {
+	h.mu.Lock()
+	h.block = b
+	h.mu.Unlock()
+}
+
+// BlockReason 返回任务最近一次入队时的阻塞维度（未排队为 BlockNone）。
+// 用于复盘：任务到底是被本组预算、全局并发还是全局资源挡住。
+func (h *Handle) BlockReason() BlockReason {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.block
+}
+
+// GroupName 返回任务所属业务组名。
+func (h *Handle) GroupName() string { return h.group }
 
 func newHandle(t *Task, ctx context.Context) *Handle {
 	return &Handle{task: t, done: make(chan struct{}), status: StatusQueued, ctx: ctx}
