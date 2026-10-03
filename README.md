@@ -199,6 +199,10 @@ group  resourceUsed + cost <= GroupConfig.ResourceLimit(若 >0)
   任务从未记账，因此不释放。
 - `Handle.finish` 用关闭 `done` 通道的幂等模式保证终态只结算一次；
   任务另有 `detached` 标记，区分"正常结算释放"与"关闭超时强制回收"。
+- **动账权归属终态登记**：正常结算（`settle`）与超时强制回收
+  （`abandonLocked`）都以"赢得 `finish`"为动账前提——同一任务的容量
+  在任何交错下都恰好归还一次，关闭时刻的在运行快照里混着"已正常结束"
+  的任务也不会被重复回收。
 - 若因任何 bug 导致重复释放或出现负数，全局账 / 组账都会立即 `panic`，
   而不是静默把账做坏。见 `TestDoubleReleaseGuardsAccount`。
 
@@ -240,6 +244,25 @@ Groups: payments{concurrency=1/4 resource=20/80 queued=2} search{...}
   摘除运行登记而**不再触碰账目**——不会重复释放、不会出现负数
   （`TestShutdownReclaimsCapacityAfterMaxWait`、
   `TestCloseGroupReclaimsAndOthersSurvive`、`TestCloseGroupDrainsQueued`）。
+
+**同一批任务"部分正常结束、部分超时被放弃"的混合场景**（本次修复的核心）：
+
+- 关闭流程（`CloseGroup` 与 `Shutdown` 同构）在 ctx 到期后，会枚举**关闭
+  时刻**的在运行快照逐个回收。但等待窗口内可能已有任务响应取消、正常结算
+  ——它们的容量已由 `settle` 归还过，**绝不能被超时回收再还第二次**。
+- 仲裁规则：**只有"赢得终态登记"（`Handle.finish` 返回 `true`）的路径才
+  允许动账**。正常结算与超时回收在同一把 `mu` 下竞争同一个任务的终态：
+  谁先完成 `finish`，谁就独占这次容量归还；后到者发现终态已登记便原样
+  跳过。因此无论"谁先结束、谁卡死、结束与卡死的先后顺序如何变化"，每个
+  任务的容量都**恰好归还一次**。
+- 结果保证：不 panic、不出现负账；回收完成后全局账与组账精确归零；被放弃
+  任务日后退出（僵尸 goroutine 收尾）只摘登记、不动账；单组关闭时其他
+  业务组的账目与服务完全不受连累。
+- 覆盖测试：`TestCloseGroupMixedSettleAndStuck`（只关该组）、
+  `TestShutdownMixedSettleAndStuck`（整体关闭）、
+  `TestCloseGroupMixedMatrix`（结束/卡死数量组合矩阵 + 他组不受影响）、
+  `TestShutdownMixedRaceWindow`（结束时刻贴着超时边界竞争，30 次迭代 +
+  race 检测验证任意交错下账目都归零且不为负）。
 
 终态互斥归类于 `classify`：`PANICKED > TIMED_OUT > CANCELED > FAILED > SUCCEEDED`；
 `ABANDONED / REJECTED` 为准入/关闭阶段的独立终态。
@@ -295,6 +318,7 @@ go test -run TestInterGroup ./...       # 组间轮转公平
 go test -run TestIntraGroup ./...       # 组内优先级 / 老化
 go test -run TestRuntimeAdjust ./...    # 运行期调整全局/组上限
 go test -run TestReclaims ./...         # 超最大等待后容量回收
+go test -run 'Mixed|RaceWindow' -v ./... # 混合场景：部分正常结束 + 部分卡死超时回收
 go test -run TestCapacityReused ./...   # 任务结束后容量立即可复用
 go test -run TestReproducible ./...     # 单池 + 分组可复现性
 go test -run TestNoGoroutineLeak ./...  # 长期运行协程有界
@@ -303,7 +327,9 @@ go test -run TestPanic ./...            # panic 隔离
 
 测试覆盖：全局 + 组双维度配额隔离、四种排队阻塞原因、六类拒绝原因、队列满、
 单池与组内优先级顺序、组内老化防饥饿、组间轮转防饿死、排队/运行取消、超时、
-暂停/恢复、全局与单组优雅关闭、超时容量回收与僵尸不重复释放、panic 隔离、
+暂停/恢复、全局与单组优雅关闭、超时容量回收与僵尸不重复释放、**同批任务
+部分正常结束 + 部分卡死的混合关闭场景（单组关闭与整体关闭两条路径、
+结束/卡死数量矩阵、超时边界竞争）**、panic 隔离、
 永久阻塞不毁账、重复释放拦截、句柄幂等结算、运行期扩容/缩容账目不变量、
 任务结束容量零窗复用、长期运行协程有界、400 任务高并发账目不变量看门狗，
 以及单池与分组随机种子负载下的逐位可复现调度。

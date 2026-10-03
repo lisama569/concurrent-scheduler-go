@@ -634,15 +634,24 @@ func (s *Scheduler) settle(h *Handle, t *Task, status Status, err error) {
 // abandonLocked 在 mu 内放弃一个超过最大等待仍不退出的在运行任务：
 // 收回它在全局账与组账上的容量并登记 ABANDONED 终态。每个任务至多一次；
 // 其 goroutine 日后退出时走 settle 的 detached 分支，只摘登记、不碰账。
+//
+// 关键不变式：只有"赢得终态登记"（h.finish 返回 true）的路径才允许动账。
+// 关闭流程枚举的是关闭时刻的在运行快照，其中可能已有任务在等待窗口内
+// 正常结算（容量已由 settle 归还）——对这类任务 finish 必然返回 false，
+// 必须原样跳过，否则会把同一笔容量归还第二次，把账目压成负数。
 func (s *Scheduler) abandonLocked(h *Handle, g *groupState, basis string) {
 	if h.detached {
+		return
+	}
+	if !h.finish(StatusAbandoned, ErrTaskAbandoned) {
+		// 该任务已在等待窗口内正常结算（或已被他途结算）：容量早已归还，
+		// 这里绝不能再动账。
 		return
 	}
 	h.detached = true
 	s.quota.release(h.task.Cost)
 	g.abandon(h, h.task.Cost)
 	s.wg.Done()
-	h.finish(StatusAbandoned, ErrTaskAbandoned)
 	if s.onTerminal != nil {
 		s.onTerminal(h.task.ID, StatusAbandoned)
 	}
