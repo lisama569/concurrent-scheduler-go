@@ -11,7 +11,7 @@ func runGroupedDeterministic(t *testing.T, jobs []SimJob, cfg Config, groups []G
 	t.Helper()
 	s := New(cfg, groups...)
 	if log {
-		s.WithLogger(testLogger{t})
+		s.WithLogger(newTestLogger(t))
 	}
 	r := NewDeterministicRunner(s)
 	r.freeze()

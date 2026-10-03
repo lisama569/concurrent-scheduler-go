@@ -14,7 +14,7 @@ import (
 func TestNoGoroutineLeakAcrossManyTasks(t *testing.T) {
 	s := New(Config{MaxConcurrency: 8, ResourceLimit: 100, QueueCapacity: 0},
 		GroupConfig{Name: "A", MaxConcurrency: 8, ResourceLimit: 100},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 	ctx := context.Background()
 
 	measure := func() int {
@@ -70,7 +70,7 @@ func TestNoGoroutineLeakAcrossManyTasks(t *testing.T) {
 // TestQueuedCancelWatchersReclaimed：大量"排队即取消"的任务不应残留协程。
 func TestQueuedCancelWatchersReclaimed(t *testing.T) {
 	// 全局只 1 槽且被占住，后续任务全部排队，随即取消。
-	s := New(Config{MaxConcurrency: 1, ResourceLimit: 100, QueueCapacity: 0}).WithLogger(testLogger{t})
+	s := New(Config{MaxConcurrency: 1, ResourceLimit: 100, QueueCapacity: 0}).WithLogger(newTestLogger(t))
 	block := make(chan struct{})
 	started := make(chan struct{})
 	_, _ = s.Submit(context.Background(), task("holder", 1, PriorityNormal, func(ctx context.Context) error {

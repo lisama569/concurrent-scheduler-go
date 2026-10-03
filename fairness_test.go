@@ -15,7 +15,7 @@ func TestInterGroupFairnessRoundRobin(t *testing.T) {
 	s := New(Config{MaxConcurrency: 1, ResourceLimit: 100},
 		GroupConfig{Name: "A", MaxConcurrency: 10, ResourceLimit: 100},
 		GroupConfig{Name: "B", MaxConcurrency: 10, ResourceLimit: 100},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 	ctx := context.Background()
 
 	block := make(chan struct{})
@@ -103,7 +103,7 @@ func TestInterGroupFairnessRoundRobin(t *testing.T) {
 func TestIntraGroupPriorityStillHolds(t *testing.T) {
 	s := New(Config{MaxConcurrency: 1, ResourceLimit: 100},
 		GroupConfig{Name: "A", MaxConcurrency: 10, ResourceLimit: 100},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 	ctx := context.Background()
 	block := make(chan struct{})
 	started := make(chan struct{})
@@ -154,7 +154,7 @@ func TestIntraGroupPriorityStillHolds(t *testing.T) {
 func TestIntraGroupAgingPreventsStarvation(t *testing.T) {
 	s := New(Config{MaxConcurrency: 1, ResourceLimit: 100, QueueCapacity: 64},
 		GroupConfig{Name: "A", MaxConcurrency: 10, ResourceLimit: 100},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 	ctx := context.Background()
 	block := make(chan struct{})
 	started := make(chan struct{})

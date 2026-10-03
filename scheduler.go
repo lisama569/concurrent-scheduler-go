@@ -326,13 +326,10 @@ func (s *Scheduler) waitGroupSettle(g *groupState, running []*Handle, ctx contex
 			g.name, s.Snapshot())
 		return nil
 	case <-ctx.Done():
-		// 超过最大等待：把仍未退出（未脱管）任务的容量收回。
+		// 超过最大等待：只把仍未退出（未结算、未脱管）任务的容量收回；
+		// 已在窗口内正常结束的任务早已由 settle 归还，这里跳过。
 		s.mu.Lock()
-		for _, h := range running {
-			if !h.detached {
-				s.abandonLocked(h, g, "group close max wait exceeded; capacity reclaimed")
-			}
-		}
+		s.reclaimStuckLocked(running, "group close max wait exceeded; capacity reclaimed")
 		s.mu.Unlock()
 		s.cond.Broadcast()
 		return ctx.Err()
@@ -368,14 +365,10 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 		s.log.Logf("DECISION action=SHUTDOWN-DONE task=- cost=0 basis=\"all running tasks settled\" | %s", s.Snapshot())
 		return nil
 	case <-ctx.Done():
-		// 超过最大等待仍有任务卡死：逐个收回它们仍占着的容量。
+		// 超过最大等待仍有任务卡死：逐个收回"确实还没结束"的任务仍占着
+		// 的容量；窗口内已正常结束的任务由 settle 归还过，跳过不重复扣。
 		s.mu.Lock()
-		for _, h := range running {
-			if !h.detached {
-				s.abandonLocked(h, s.registry.get(h.group),
-					"shutdown max wait exceeded; capacity reclaimed")
-			}
-		}
+		s.reclaimStuckLocked(running, "shutdown max wait exceeded; capacity reclaimed")
 		s.mu.Unlock()
 		s.cond.Broadcast()
 		return ctx.Err()
@@ -613,9 +606,13 @@ func (s *Scheduler) settle(h *Handle, t *Task, status Status, err error) {
 		return
 	}
 	// 先归还容量（全局账 + 组账 + 等待计数），再登记终态，全程持锁。
+	// settled 与关闭回收路径的 detached 在同一把 mu 下竞争：谁先完成
+	// "认领 + 归还"，另一条路径就必须什么账都不动，从而保证部分正常结束、
+	// 部分超时放弃的混合批次里每个任务的容量恰好归还一次。
 	s.quota.release(t.Cost)
 	g.release(h, t.Cost)
 	s.wg.Done()
+	h.settled = true
 	h.finish(status, err)
 	snap := s.snapshotLocked()
 	if s.onTerminal != nil {
@@ -634,9 +631,18 @@ func (s *Scheduler) settle(h *Handle, t *Task, status Status, err error) {
 // abandonLocked 在 mu 内放弃一个超过最大等待仍不退出的在运行任务：
 // 收回它在全局账与组账上的容量并登记 ABANDONED 终态。每个任务至多一次；
 // 其 goroutine 日后退出时走 settle 的 detached 分支，只摘登记、不碰账。
+//
+// 认领规则（与 settle 对称，二者在同一把 mu 内竞争）：只有既未被正常
+// 结算（settled）、也未被超时回收（detached）的任务才会真正归还容量。
+// 因此关闭等待窗口内"一部分任务已正常结束、另一部分仍卡死"的混合批次中，
+// 回收只会落到确实还没结束的任务上，已结束任务的容量绝不会被扣第二次，
+// 任何结束/卡死的先后组合都不会产生负数或重复 wg.Done。
 func (s *Scheduler) abandonLocked(h *Handle, g *groupState, basis string) {
-	if h.detached {
+	if h.detached || h.settled {
 		return
+	}
+	if g == nil {
+		g = s.registry.get(h.group)
 	}
 	h.detached = true
 	s.quota.release(h.task.Cost)
@@ -649,4 +655,13 @@ func (s *Scheduler) abandonLocked(h *Handle, g *groupState, basis string) {
 	logDecision(s.log, "RELEASE-ABANDON", g.name, h.task.ID, h.task.Cost,
 		basis+"; task detached, future exit will not touch accounts", s.snapshotLocked())
 	h.endWatch()
+}
+
+// reclaimStuckLocked 遍历关闭批次中的在运行句柄，只对"既未正常结算也未被
+// 回收"的任务执行超时放弃。已在等待窗口内自行结束的任务一律跳过——
+// 它们的容量已由 settle 精确归还一次。调用方持有 Scheduler.mu。
+func (s *Scheduler) reclaimStuckLocked(running []*Handle, basis string) {
+	for _, h := range running {
+		s.abandonLocked(h, s.registry.get(h.group), basis)
+	}
 }

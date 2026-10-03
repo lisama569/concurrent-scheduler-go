@@ -227,9 +227,9 @@ Groups: payments{concurrency=1/4 resource=20/80 queued=2} search{...}
 | 暂停 / 恢复 | `Pause` 后新任务与已排队任务等待，运行中任务不受影响；`Resume` 继续 |
 | 全局优雅关闭 | 所有组停收、取消全部排队与在运行任务，等待结束或 ctx 到期 |
 | **单独关闭某组** | `CloseGroup(name, ctx)`：只停收该组、清空并取消该组排队任务、取消该组在运行任务；**其他组（含默认组）不受影响、继续服务** |
-| **超过最大等待** | `Shutdown` / `CloseGroup` 的 ctx Deadline 即最大等待时间；超时后仍不理会取消的任务被**强制收回容量**并标记新终态 `ABANDONED`，组件可继续被复用/重启 |
+| **超过最大等待** | `Shutdown` / `CloseGroup` 的 ctx Deadline 即最大等待时间；超时后**只对仍未结束**的任务强制收回容量并标记 `ABANDONED`，窗口内已自行结束的任务不重复扣，全局/组账精确归零，组件可继续被复用/重启 |
 | 任务 panic | panic 屏障就地 `recover`，结算为 `PANICKED` 并打印栈；不逃逸、不毁账、不影响他人 |
-| 永久阻塞 | 忽略 ctx 的任务不会破坏账目；超最大等待后容量被回收，僵尸 goroutine 日后退出走"已脱管"分支，只摘登记、绝不重复释放 |
+| 永久阻塞 / 混合批次 | 同批任务部分在窗口内正常结束、部分永久忽略 ctx 时：正常任务由结算路径归还一次、卡死任务由超时回收归还一次（`settled`/`detached` 互斥认领）；僵尸 goroutine 日后退出走"已脱管"分支，只摘登记、绝不重复释放，账目恒非负、他组不受连累 |
 
 **容量回收与关闭语义（`ABANDONED`）**：
 
@@ -240,6 +240,36 @@ Groups: payments{concurrency=1/4 resource=20/80 queued=2} search{...}
   摘除运行登记而**不再触碰账目**——不会重复释放、不会出现负数
   （`TestShutdownReclaimsCapacityAfterMaxWait`、
   `TestCloseGroupReclaimsAndOthersSurvive`、`TestCloseGroupDrainsQueued`）。
+
+**同一批任务"部分正常结束、部分超时被放弃"时的账目对齐（混合批次）**：
+
+关闭（`CloseGroup` 某组或 `Shutdown` 全局）只等待 ctx Deadline 所定义的最大
+等待时间。一批在跑任务里，只要有任务完全不理会取消，关闭就会走到"超时
+回收"分支；而此时另一部分任务往往已经在等待窗口内自行结束。两类任务的
+容量归还严格互斥、恰好一次：
+
+1. **正常结束的任务走结算路径（`settle`）**：在唯一的 `Scheduler.mu` 临界区内
+   归还全局账 + 组账、对全局/组两个 `WaitGroup` 各 `Done` 一次，并置 `settled`
+   认领位。它们的容量**只归还这一次**。
+2. **超时仍卡死的任务走回收路径（`abandonLocked`）**：回收遍历关闭批次时，
+   只认领"既未 `settled`（未自行结算）、也未 `detached`（未被回收过）"的任务，
+   对其归还两本账、`Done` 两个计数并置 `detached` + 登记 `ABANDONED`；
+   **已经自行结束的任务一律跳过**，绝不二次扣减。
+3. `settle` 与 `abandonLocked` 在同一把锁内对称地竞争认领，因此无论任务有几个、
+   谁先结束谁后卡死、结束发生在超时前的哪个时刻，结论都稳定：全局账与组账
+   恒非负，回收完成后被关组（全局关闭时则为全部组）账目精确归零，
+   **不多扣、不漏扣**；只关某个组时，其他业务组与默认组的在跑任务和账目
+   完全不受连累，且该组停收（新提交得 `GROUP_STOPPED`）。
+4. 被放弃任务的僵尸 goroutine 日后真正退出时进入 `settle` 的 `detached` 分支：
+   只从在跑集合摘除登记、终态保持 `ABANDONED` 不被覆盖，**绝不再动账目**。
+
+> 修复前的缺陷：超时回收只认 `detached` 标记，而正常结算路径从不设置它，
+> 导致窗口内已结束的任务在超时点被**二次 `release` / `wg.Done`**，账目被扣成
+> 负数并直接 panic。现在由 `settled` / `detached` 两个互斥认领位在同一把锁内
+> 保证"每个任务的容量恰好经由其中一条路径归还一次"。
+> 回归用例见 `TestCloseReclaimMixedBatch`（关闭路径 × 任务数 × 结束早晚 ×
+> 提交先后的场景矩阵）与 `TestCloseReclaimSettleRaceStress`（`settle` 与超时
+> 回收高并发竞争的多轮压力，建议配合 `-race` 运行）。
 
 终态互斥归类于 `classify`：`PANICKED > TIMED_OUT > CANCELED > FAILED > SUCCEEDED`；
 `ABANDONED / REJECTED` 为准入/关闭阶段的独立终态。
@@ -262,7 +292,9 @@ DECISION action=RELEASE-ABANDON group="payments" task=stuck cost=20 basis="shutd
 DECISION action=REJECT group="payments" task=big cost=99 basis="cost exceeds group hard limit" | snapshot{...}
 ```
 
-测试通过 `testLogger{t}` 把这些决策写入 `go test -v` 输出。
+测试通过 `newTestLogger(t)` 把这些决策缓冲并在测试收尾统一写入
+`go test -v` 输出（缓冲带锁，避免任务 goroutine 的日志与测试生命周期构成
+data race）。
 
 ## 6. 可复现验证方法（关键）
 
@@ -295,6 +327,8 @@ go test -run TestInterGroup ./...       # 组间轮转公平
 go test -run TestIntraGroup ./...       # 组内优先级 / 老化
 go test -run TestRuntimeAdjust ./...    # 运行期调整全局/组上限
 go test -run TestReclaims ./...         # 超最大等待后容量回收
+go test -run TestCloseReclaim ./...     # 混合批次（部分结束+部分卡死）关闭回收
+go test -race -run TestCloseReclaimSettleRaceStress ./...  # 结算 vs 超时回收竞争压力
 go test -run TestCapacityReused ./...   # 任务结束后容量立即可复用
 go test -run TestReproducible ./...     # 单池 + 分组可复现性
 go test -run TestNoGoroutineLeak ./...  # 长期运行协程有界
@@ -303,7 +337,9 @@ go test -run TestPanic ./...            # panic 隔离
 
 测试覆盖：全局 + 组双维度配额隔离、四种排队阻塞原因、六类拒绝原因、队列满、
 单池与组内优先级顺序、组内老化防饥饿、组间轮转防饿死、排队/运行取消、超时、
-暂停/恢复、全局与单组优雅关闭、超时容量回收与僵尸不重复释放、panic 隔离、
+暂停/恢复、全局与单组优雅关闭、超时容量回收与僵尸不重复释放、
+混合批次（同批部分正常结束部分超时放弃）下两条路径的容量恰好各归还一次、
+回收只落到未结束任务、账目恒非负并归零且不连累他组、panic 隔离、
 永久阻塞不毁账、重复释放拦截、句柄幂等结算、运行期扩容/缩容账目不变量、
 任务结束容量零窗复用、长期运行协程有界、400 任务高并发账目不变量看门狗，
 以及单池与分组随机种子负载下的逐位可复现调度。

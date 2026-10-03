@@ -113,6 +113,11 @@ type Handle struct {
 	// detached 仅在 Scheduler.mu 下访问：任务已被放弃（容量已收回），
 	// 其僵尸 goroutine 日后退出时不得再次释放。
 	detached bool
+	// settled 仅在 Scheduler.mu 下访问：任务已通过正常结算路径归还过容量
+	// （全局账 + 组账 + 两个 WaitGroup 都已 Done）。关闭流程超时回收时
+	// 必须跳过这类任务，否则会二次释放导致账目为负 / WaitGroup 计数崩溃。
+	// settled 与 detached 互斥：一个任务的容量恰好经由二者之一归还一次。
+	settled bool
 }
 
 // bindWatch 由调度器在注册排队取消监听成功后调用。

@@ -11,7 +11,7 @@ import (
 // 分组测试公共助手：创建带两个业务组 A/B 的调度器。
 func newGroupedScheduler(t *testing.T, cfg Config, ga, gb GroupConfig) *Scheduler {
 	t.Helper()
-	return New(cfg, ga, gb).WithLogger(testLogger{t})
+	return New(cfg, ga, gb).WithLogger(newTestLogger(t))
 }
 
 // TestGroupQuotaIsolation：一个组用满自己的预算后，不能动用另一个组的
@@ -203,7 +203,7 @@ func shutdownOK(t *testing.T, s *Scheduler) {
 // CloseGroup 后该组按 GROUP_STOPPED 拒绝，且不影响其他组。
 func TestRejectUnknownAndClosedGroup(t *testing.T) {
 	s := New(Config{MaxConcurrency: 4, ResourceLimit: 1000},
-		GroupConfig{Name: "A", MaxConcurrency: 4, ResourceLimit: 100}).WithLogger(testLogger{t})
+		GroupConfig{Name: "A", MaxConcurrency: 4, ResourceLimit: 100}).WithLogger(newTestLogger(t))
 
 	_, err := s.Submit(context.Background(), &Task{ID: "x", Group: "NOPE", Cost: 1, Fn: noop()})
 	var re *RejectError
@@ -240,7 +240,7 @@ func TestRejectUnknownAndClosedGroup(t *testing.T) {
 // TestDefaultGroupIsUnlimited：不声明 Group 的任务只受全局上限约束，
 // 与单池版本完全兼容（本组维度永不拦截）。
 func TestDefaultGroupIsUnlimited(t *testing.T) {
-	s := New(Config{MaxConcurrency: 2, ResourceLimit: 10}).WithLogger(testLogger{t})
+	s := New(Config{MaxConcurrency: 2, ResourceLimit: 10}).WithLogger(newTestLogger(t))
 	block := make(chan struct{})
 	var handles []*Handle
 	for i := 0; i < 2; i++ {

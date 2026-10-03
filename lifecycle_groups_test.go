@@ -15,7 +15,7 @@ import (
 func TestCapacityReusedImmediatelyOnResult(t *testing.T) {
 	s := New(Config{MaxConcurrency: 1, ResourceLimit: 10},
 		GroupConfig{Name: "A", MaxConcurrency: 1, ResourceLimit: 10},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 	ctx := context.Background()
 
 	holderExit := make(chan struct{})
@@ -69,7 +69,7 @@ func TestCapacityReusedImmediatelyOnResult(t *testing.T) {
 func TestRuntimeAdjustGroupLimits(t *testing.T) {
 	s := New(Config{MaxConcurrency: 10, ResourceLimit: 100},
 		GroupConfig{Name: "A", MaxConcurrency: 2, ResourceLimit: 100},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 	ctx := context.Background()
 	block := make(chan struct{})
 	started := make(chan struct{})
@@ -141,7 +141,7 @@ func TestRuntimeAdjustGroupLimits(t *testing.T) {
 func TestRuntimeAdjustGlobalLimits(t *testing.T) {
 	s := New(Config{MaxConcurrency: 4, ResourceLimit: 100},
 		GroupConfig{Name: "A", MaxConcurrency: 10, ResourceLimit: 100},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 	ctx := context.Background()
 
 	// 缩全局并发到 1，再提交两个阻塞任务：只能有一个在跑。
@@ -183,7 +183,7 @@ func TestShutdownReclaimsCapacityAfterMaxWait(t *testing.T) {
 	s := New(Config{MaxConcurrency: 4, ResourceLimit: 20},
 		GroupConfig{Name: "A", MaxConcurrency: 4, ResourceLimit: 20},
 		GroupConfig{Name: "B", MaxConcurrency: 4, ResourceLimit: 20},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 
 	stuckExit := make(chan struct{})
 	stuckStarted := make(chan struct{})
@@ -250,7 +250,7 @@ func TestShutdownReclaimsCapacityAfterMaxWait(t *testing.T) {
 func TestCloseGroupReclaimsAndOthersSurvive(t *testing.T) {
 	s := New(Config{MaxConcurrency: 8, ResourceLimit: 100},
 		GroupConfig{Name: "A", MaxConcurrency: 8, ResourceLimit: 100},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 
 	stuckExit := make(chan struct{})
 	stuckStarted := make(chan struct{})
@@ -301,7 +301,7 @@ func TestCloseGroupDrainsQueued(t *testing.T) {
 	s := New(Config{MaxConcurrency: 1, ResourceLimit: 100},
 		GroupConfig{Name: "A", MaxConcurrency: 10, ResourceLimit: 100},
 		GroupConfig{Name: "B", MaxConcurrency: 10, ResourceLimit: 100},
-	).WithLogger(testLogger{t})
+	).WithLogger(newTestLogger(t))
 	block := make(chan struct{})
 	started := make(chan struct{})
 	// holder 放默认组占住全局唯一槽，迫使 A/B 任务排队。

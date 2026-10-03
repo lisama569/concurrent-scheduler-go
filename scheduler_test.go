@@ -11,15 +11,46 @@ import (
 
 // testLogger 把每次准入/排队/拒绝/释放决策与资源快照打印到测试日志，
 // 满足"单测日志中需要打印每次准入与释放的决策依据及资源快照"。
-type testLogger struct{ t *testing.T }
+//
+// 决策日志由任务 goroutine（settle）、派发 goroutine、关闭调用方等多个
+// 线程并发产生，而 testing.T 只允许在测试自身生命周期内使用。直接 t.Logf
+// 在极端时序下会与测试函数返回构成 data race（-race 偶发）。因此这里先把
+// 日志追加进带锁缓冲，并通过 t.Cleanup 在测试收尾（所有在跑任务均已被
+// Shutdown/CloseGroup 结算或回收、不再有新日志）统一 flush 到 t.Logf。
+type testLogger struct {
+	t   *testing.T
+	buf *testLogBuffer
+}
+
+type testLogBuffer struct {
+	mu  sync.Mutex
+	msg []string
+}
+
+func newTestLogger(t *testing.T) testLogger {
+	l := testLogger{t: t, buf: &testLogBuffer{}}
+	t.Cleanup(func() {
+		l.buf.mu.Lock()
+		msgs := l.buf.msg
+		l.buf.msg = nil
+		l.buf.mu.Unlock()
+		for _, m := range msgs {
+			t.Log(m)
+		}
+	})
+	return l
+}
 
 func (l testLogger) Logf(format string, args ...any) {
-	l.t.Logf(format, args...)
+	msg := fmt.Sprintf(format, args...)
+	l.buf.mu.Lock()
+	l.buf.msg = append(l.buf.msg, msg)
+	l.buf.mu.Unlock()
 }
 
 func newTestScheduler(t *testing.T, cfg Config) *Scheduler {
 	t.Helper()
-	return New(cfg).WithLogger(testLogger{t})
+	return New(cfg).WithLogger(newTestLogger(t))
 }
 
 func waitHandle(t *testing.T, h *Handle, timeout time.Duration) {
